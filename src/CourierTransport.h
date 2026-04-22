@@ -10,10 +10,12 @@
 class CourierTransport {
 public:
     using MessageCallback = std::function<void(const char* payload, size_t length)>;
+    using BinaryMessageCallback = std::function<void(const uint8_t* data, size_t length)>;
     using ConnectionCallback = std::function<void(CourierTransport* transport, bool connected)>;
 
     virtual ~CourierTransport() {
         free(_pendingPayload);
+        free(_pendingBinary);
     }
 
     virtual void begin(const char* host, uint16_t port, const char* path) = 0;
@@ -40,10 +42,12 @@ public:
     void setFailureCallback(FailureCallback cb) { _onFailure = cb; }
 
     void setMessageCallback(MessageCallback cb) { _onMessage = cb; }
+    void setBinaryMessageCallback(BinaryMessageCallback cb) { _onBinaryMessage = cb; }
     void setConnectionCallback(ConnectionCallback cb) { _onConnection = cb; }
 
 protected:
     MessageCallback _onMessage;
+    BinaryMessageCallback _onBinaryMessage;
     ConnectionCallback _onConnection;
     FailureCallback _onFailure;
 
@@ -54,6 +58,10 @@ protected:
     char* _pendingPayload = nullptr;
     size_t _pendingLength = 0;
     std::atomic<bool> _msgPending{false};
+
+    uint8_t* _pendingBinary = nullptr;
+    size_t _pendingBinaryLength = 0;
+    std::atomic<bool> _binaryPending{false};
 
     std::atomic<bool> _connChangePending{false};
     std::atomic<bool> _connChangeState{false};
@@ -81,6 +89,20 @@ protected:
         _msgPending.store(true, std::memory_order_release);
     }
 
+    // Binary equivalent. Separate pending slot so a high-rate binary stream
+    // (e.g. audio) does not contend with the text channel.
+    void queueIncomingBinary(const uint8_t* data, size_t len) {
+        if (_binaryPending.load(std::memory_order_acquire)) {
+            return;
+        }
+        uint8_t* buf = (uint8_t*)malloc(len);
+        if (!buf) return;
+        memcpy(buf, data, len);
+        _pendingBinary = buf;
+        _pendingBinaryLength = len;
+        _binaryPending.store(true, std::memory_order_release);
+    }
+
     // Called from transport event handler.
     void queueConnectionChange(bool connected) {
         _connChangeState.store(connected, std::memory_order_relaxed);
@@ -98,6 +120,12 @@ protected:
             free(_pendingPayload);
             _pendingPayload = nullptr;
             _msgPending.store(false, std::memory_order_release);
+        }
+        if (_binaryPending.load(std::memory_order_acquire)) {
+            if (_onBinaryMessage) _onBinaryMessage(_pendingBinary, _pendingBinaryLength);
+            free(_pendingBinary);
+            _pendingBinary = nullptr;
+            _binaryPending.store(false, std::memory_order_release);
         }
         if (_connChangePending.load(std::memory_order_acquire)) {
             bool state = _connChangeState.load(std::memory_order_relaxed);
