@@ -5,26 +5,19 @@ Cloudflare Worker. An M5Stick captures mic audio, streams it over a
 WebSocket to the Worker, and plays back the Gemini audio response.
 
 ```
-M5Stick ──(WS binary: 16kHz PCM)──▶ Cloudflare Worker (DO) ──▶ Gemini Live API
-        ◀──(WS binary: 24kHz PCM)──                         ◀──  (speech-to-speech)
-        ◀──(WS JSON:  control)─────
+M5Stick  ◀──WebSocket──▶  Cloudflare Worker (DO)  ◀──WebSocket──▶  Gemini Live API
+  mic + speaker               session relay                          speech-to-speech
 ```
 
-## Why this example exists
+## What this example shows
 
-This demo exercises two parts of Courier that don't show up in the simpler
-examples:
+Two parts of Courier the simpler examples don't exercise:
 
-- **Binary WS frames** (`onBinaryMessage`) — Gemini's audio comes back as
-  raw PCM in binary frames, not JSON. The device plays them straight into
-  the speaker.
-- **Bursts of JSON frames** — the Worker sends three control messages in
-  the same scheduler slice on connect (`session` → `ready` → `settings`).
-  Courier's internal FIFO absorbs the burst so none of them get dropped.
-
-If you're building voice, streaming telemetry, or anything where the
-server talks back with both binary payloads _and_ control messages, this
-is the shape.
+- **Binary WS frames** (`sendBinaryTo` / `onBinaryMessage`) — mic PCM
+  out, Gemini audio PCM in. Raw, not base64-in-JSON.
+- **Bursts of JSON frames on connect** — the Worker sends
+  `session` → `ready` → `settings` in one scheduler slice; Courier's
+  transport FIFO keeps all three.
 
 ## Structure
 
@@ -89,13 +82,10 @@ line) and re-flash.
 
 Two M5Stick variants are supported:
 
-- **M5StickC Plus2** (yellow) — ESP32-PICO-V3-02, CH9102 USB-UART bridge
-- **M5StickS3** (grey) — ESP32-S3, native USB (uses the built-in speaker
-  and MEMS mic)
-
-The S3 has a proper speaker and microphone, so that's the one to pick if
-you want audible voice. The Plus2 mic + buzzer will still run the demo
-but the audio quality is limited.
+- **M5StickS3** (grey) — ESP32-S3. Proper speaker + MEMS mic. Pick this
+  one for audible voice.
+- **M5StickC Plus2** (yellow, default env) — ESP32-PICO-V3-02. Buzzer
+  only, so audio playback is limited.
 
 ### Build & flash
 
@@ -132,13 +122,7 @@ to the captive portal.
 
 ## Notes
 
-- Audio in is 16 kHz mono `int16`; audio out is 24 kHz mono `int16`.
+- Audio in is 16 kHz mono `int16`; audio out is 24 kHz mono `int16` —
   Gemini Live is fixed at these rates.
-- The `sendBinaryTo("ws", ...)` API on the device and `onBinaryMessage`
-  callback are the binary-frame primitives. They live alongside the
-  existing text `send()` / `onMessage()` — you can use both in the same
-  session.
-- The burst of `session`/`ready`/`settings` frames on connect is
-  intentional — it's the minimum set the device needs to start a session
-  and it's the reason Courier's transport uses a FIFO rather than a
-  single-slot pending buffer.
+- `sendBinaryTo("ws", ...)` and `onBinaryMessage` live alongside the
+  text `send()` / `onMessage()` APIs — use both in the same session.
