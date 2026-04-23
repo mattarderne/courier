@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "gemini-speech-to-speech",
+  "name": "gemini-chat",
   "main": "src/server.ts",
   "compatibility_date": "2026-03-02",
   "compatibility_flags": ["nodejs_compat"],

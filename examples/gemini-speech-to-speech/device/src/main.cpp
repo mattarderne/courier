@@ -94,7 +94,7 @@ char wsPath[64] = "/ws?device_id=gemini-s2s-default";
 CourierConfig makeConfig() {
   CourierConfig cfg;
   // Replace with your deployed Worker hostname before flashing.
-  cfg.host   = "YOUR-WORKER.workers.dev";
+  cfg.host   = "gemini-chat.m-arderne.workers.dev";
   cfg.port   = 443;
   cfg.path   = wsPath;
   cfg.apName = "Gemini S2S";
@@ -149,7 +149,7 @@ void compactPlaybackBuffer() {
 // binary frames; append into the PSRAM ring and let the main loop drain
 // them in one shot. playRaw holds the caller's pointer until isPlaying()
 // clears, so we must not memmove while a drain is in flight.
-void onAudio(const uint8_t *data, size_t len) {
+void onAudio(const char *data, size_t len) {
   if (!playBuffer || len == 0 || (len & 1)) return;  // int16-aligned
   if (playWritePos + static_cast<int>(len) > playCapacity) {
     Serial.printf("[Audio] Playback overflow, dropping %u bytes\n",
@@ -223,11 +223,14 @@ void onControl(const char *type, JsonDocument &doc) {
     return;
   }
   if (strcmp(type, "settings") == 0) {
-    // Applied silently — here we just log that it arrived, which is the
-    // whole point: before the FIFO fix, this third frame of the burst
-    // used to get dropped.
+    // Re-broadcast on every change (volume/brightness tool calls), so
+    // applying here idempotently is the whole contract. Missing fields
+    // fall back to current values via the `|` default in each getter.
     const uint8_t vol = doc["volume"] | 128;
     M5.Speaker.setVolume(vol);
+    if (doc.containsKey("brightness")) {
+      M5.Display.setBrightness(static_cast<uint8_t>(doc["brightness"].as<int>()));
+    }
     return;
   }
   if (strcmp(type, "transcript") == 0) {
@@ -301,7 +304,7 @@ void setup() {
   });
 
   courier.onMessage(onControl);
-  courier.onBinaryMessage(onAudio);
+  courier.onRawMessage(onAudio);
 
   courier.onError([](const char *category, const char *message) {
     Serial.printf("[Courier] %s: %s\n", category, message);
