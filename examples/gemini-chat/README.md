@@ -118,6 +118,24 @@ Connect to it from your phone and enter your Wi-Fi credentials via the
 captive portal. Courier persists them for next boot. (ESP32 is 2.4 GHz
 only.)
 
+### Skipping the captive portal
+
+The firmware also supports pre-connecting to a known Wi-Fi network by
+reading `WIFI_SSID` and `WIFI_PASSWORD` from the shell at flash time.
+`WiFi.persistent(false)` is called before `WiFi.begin`, so nothing lands
+in NVS — the password lives only in the firmware binary and in RAM.
+
+Example with the 1Password CLI:
+
+```bash
+cd device
+WIFI_SSID=$(op read "op://Personal/Home wifi/network name") \
+WIFI_PASSWORD=$(op read "op://Personal/Home wifi/password") \
+  pio run -e m5sticks3 -t upload
+```
+
+When both are unset, the build falls through to the captive portal.
+
 ### Using it
 
 1. Hold button A to talk.
