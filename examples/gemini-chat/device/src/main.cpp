@@ -57,9 +57,28 @@ namespace {
 constexpr uint32_t kMicSampleRate = 16000;  // Gemini Live input format
 constexpr uint32_t kSpkSampleRate = 24000;  // Gemini Live output format
 constexpr size_t   kMicChunkSamples = 320;  // 20ms @ 16kHz
-constexpr size_t   kPlaybackQueueBytes = 64 * 1024;
+
+// Playback buffer sizing. Gemini Live sends many small inlineData parts
+// per turn (each forwarded as its own WS frame). Calling playRaw per
+// frame caused discontinuities between M5Unified speaker "jobs" —
+// audible as crackle. Instead, append every frame into a PSRAM ring and
+// drain the whole thing with a single playRaw when the speaker's free.
+constexpr int kMaxPlaybackSec   = 30;                                // full reply
+constexpr int kMaxPlayBytes     = kSpkSampleRate * 2 * kMaxPlaybackSec;
+constexpr int kFallbackPlayBytes = kSpkSampleRate * 2 * 4;           // heap fallback
+constexpr int kMinPlaybackBytes = kSpkSampleRate * 2 / 4;            // 250 ms warmup
 
 int16_t micBuffer[kMicChunkSamples];
+
+// Playback state — owned by onAudio (writer) + loop() (drainer). See
+// advancePlayback() below for the invariant that keeps memmove from
+// moving bytes out from under an in-flight M5.Speaker job.
+uint8_t *playBuffer   = nullptr;
+int      playCapacity = 0;
+int      playWritePos = 0;
+int      playReadPos  = 0;
+bool     chunkInFlight   = false;
+bool     playbackStarted = false;
 
 // Track session state derived from the server's JSON burst.
 bool sessionReady  = false;     // set when we see {"type":"ready"}
@@ -99,11 +118,76 @@ void drawStatus(const char *line1, const char *line2 = nullptr) {
   }
 }
 
+void initPlayback() {
+  playBuffer = static_cast<uint8_t *>(ps_malloc(kMaxPlayBytes));
+  if (playBuffer) {
+    playCapacity = kMaxPlayBytes;
+  } else {
+    playBuffer = static_cast<uint8_t *>(malloc(kFallbackPlayBytes));
+    if (playBuffer) playCapacity = kFallbackPlayBytes;
+  }
+  Serial.printf("[Audio] Playback buffer: %d bytes\n", playCapacity);
+}
+
+void resetPlayback() {
+  M5.Speaker.stop();
+  playWritePos    = 0;
+  playReadPos     = 0;
+  chunkInFlight   = false;
+  playbackStarted = false;
+}
+
+void compactPlaybackBuffer() {
+  if (playReadPos == 0) return;
+  const int unread = playWritePos - playReadPos;
+  if (unread > 0) memmove(playBuffer, playBuffer + playReadPos, unread);
+  playReadPos  = 0;
+  playWritePos = unread;
+}
+
+// Server → device audio. Gemini's 24 kHz PCM chunks arrive as many small
+// binary frames; append into the PSRAM ring and let the main loop drain
+// them in one shot. playRaw holds the caller's pointer until isPlaying()
+// clears, so we must not memmove while a drain is in flight.
+void onAudio(const uint8_t *data, size_t len) {
+  if (!playBuffer || len == 0 || (len & 1)) return;  // int16-aligned
+  if (playWritePos + static_cast<int>(len) > playCapacity) {
+    Serial.printf("[Audio] Playback overflow, dropping %u bytes\n",
+                  static_cast<unsigned>(len));
+    return;
+  }
+  memcpy(playBuffer + playWritePos, data, len);
+  playWritePos += static_cast<int>(len);
+}
+
+// Called from loop(). Waits out any in-flight playRaw, compacts, and
+// issues a single drained playRaw once the warmup threshold is met.
+void advancePlayback() {
+  if (!playBuffer) return;
+  if (chunkInFlight && M5.Speaker.isPlaying()) return;
+  if (chunkInFlight) {
+    chunkInFlight = false;
+    compactPlaybackBuffer();
+  }
+
+  const int available = playWritePos - playReadPos;
+  if (available <= 0) return;
+  if (!playbackStarted && available < kMinPlaybackBytes) return;
+  playbackStarted = true;
+
+  auto *start = reinterpret_cast<int16_t *>(playBuffer + playReadPos);
+  const int samples = available / static_cast<int>(sizeof(int16_t));
+  M5.Speaker.playRaw(start, samples, kSpkSampleRate,
+                     /*stereo=*/false, /*repeat=*/1, /*channel=*/0);
+  playReadPos   = playWritePos;
+  chunkInFlight = true;
+}
+
 void startListening() {
   // M5StickS3: Mic and Speaker share I2S0 — speaker must be torn down
   // before Mic.begin(), otherwise the bus stays in a bad state and no
   // audio plays on the next turn (and the amp may whine).
-  M5.Speaker.stop();
+  resetPlayback();
   M5.Speaker.end();
   delay(20);
   M5.Mic.begin();
@@ -120,18 +204,6 @@ void stopListening() {
   M5.Speaker.setAllChannelVolume(180);
   courier.send(R"({"type":"stop"})");
   drawStatus("Thinking...", activeChatId.c_str());
-}
-
-// Server → device audio. Gemini's 24kHz PCM chunks stream in as raw
-// binary frames; hand them straight to the speaker.
-void onAudio(const uint8_t *data, size_t len) {
-  if (len == 0 || (len & 1)) return;  // must be int16-aligned
-  M5.Speaker.playRaw(reinterpret_cast<const int16_t *>(data),
-                     len / sizeof(int16_t),
-                     kSpkSampleRate,
-                     /*stereo=*/false,
-                     /*repeat=*/1,
-                     /*channel=*/0);
 }
 
 // Server → device control frames. These arrive as a burst on connect —
@@ -170,7 +242,7 @@ void onControl(const char *type, JsonDocument &doc) {
     return;
   }
   if (strcmp(type, "drop_audio") == 0) {
-    M5.Speaker.stop();
+    resetPlayback();
     return;
   }
 }
@@ -186,6 +258,7 @@ void setup() {
   M5.Speaker.setAllChannelVolume(180);
 
   Serial.begin(115200);
+  initPlayback();
 
   // Derive a per-board device_id from the chip MAC so two devices on the
   // same Worker land in separate Durable Objects.
@@ -240,6 +313,7 @@ void setup() {
 void loop() {
   M5.update();
   courier.loop();
+  advancePlayback();
 
   const bool pressed = M5.BtnA.isPressed();
   if (pressed && !wasPressed && sessionReady) {
